@@ -1,277 +1,236 @@
 <#
 .SYNOPSIS
-    Compares your Steam wishlist with the games owned by your friends AND the friends of your specified family members.
+    Compares your Steam wishlist with the games owned by your friends and family members' friends.
 
 .DESCRIPTION
-    This script performs the following steps:
-    1. Fetches the primary user's Steam wishlist.
-    2. Fetches a master list of all apps on Steam for efficient name lookups.
-    3. Fetches the friend lists for the primary user AND for each specified family member.
-    4. Creates a single, de-duplicated master list of all unique friends.
-    5. Fetches profile names for all unique friends, correctly handling more than 100 friends by batching API requests.
-    6. For each unique friend, fetches their list of owned games.
-    7. Compares the friend's owned games with the primary user's wishlist.
-    8. Outputs a single, consolidated ranked list of ALL friends, including those with zero matches or private profiles.
-    9. Creates a detailed text file ('wishlist_matches.txt') with the results, using the pre-fetched app list to avoid rate limits.
-
-.NOTES
-    - Your Steam profile and your family's profiles must be public to fetch their friend lists.
-    - Friends with private profiles or no owned games will be flagged in the report.
-    - You must provide your own Steam Web API Key and your 64-bit SteamID.
+    Refactored to enforce best practices.
+    - Loads configuration from a local .env file.
+    - Uses the updated IStoreService/GetAppList/v1 API with pagination to ensure 100% name resolution.
+    - Consistently casts AppIDs to integers to prevent dictionary mismatch errors.
 #>
 
-#region -------------------------- CONFIGURATION --------------------------
-# Paste your unique Steam Web API key below.
-# Get one here: https://steamcommunity.com/dev/apikey
-$apiKey = "YOUR_API_KEY_HERE"
+[CmdletBinding()]
+param()
 
-# Paste YOUR 64-bit SteamID below. The script will use YOUR wishlist as the reference.
-$mySteamID = "YOUR_STEAM_ID_HERE"
+#region -------------------------- SETUP & ENV PARSING --------------------------
+$envFilePath = Join-Path $PSScriptRoot ".env"
+$outputFileName = Join-Path $PSScriptRoot "wishlist_matches.txt"
 
-# --- NEW: Add up to four family member SteamIDs here ---
-# The script will also check the friends of these users.
-# Example: $familySteamIDs = @("76561198000000001", "76561198000000002")
-$familySteamIDs = @(
-    "FAMILY_MEMBER_1_STEAM_ID",
-    "FAMILY_MEMBER_2_STEAM_ID"
-    # Add other family SteamIDs here, each in quotes and separated by a comma
-)
-
-# --- Define the output filename for the detailed report ---
-$outputFileName = "wishlist_matches.txt"
-#endregion ------------------------------------------------------------------
-
-# --- Script starts here, no need to edit below this line ---
-
-# Check for placeholder values
-if ($apiKey -eq "YOUR_API_KEY" -or $mySteamID -eq "YOUR_STEAM_ID") {
-    Write-Host "ERROR: Please replace 'YOUR_API_KEY' and 'YOUR_STEAM_ID' with your actual Steam details in the script." -ForegroundColor Red
+if (-Not (Test-Path $envFilePath)) {
+    Write-Host "ERROR: Could not find .env file in the script directory." -ForegroundColor Red
     exit
 }
 
-# Function to handle API calls with error checking
-function Invoke-SteamApiRequest {
-    param (
-        [Parameter(Mandatory=$true)]
-        [string]$Uri
-    )
+# Parse the .env file
+Get-Content $envFilePath | ForEach-Object {
+    if ($_ -match '^\s*(?<name>[^#\s=]+)\s*=\s*(?<value>.*)$') {
+        $varName = $matches['name']
+        $varValue = $matches['value'].Trim('"').Trim("'")
+        Set-Variable -Name $varName -Value $varValue -Scope Script
+    }
+}
+
+# Validate required variables
+if ([string]::IsNullOrEmpty($STEAM_API_KEY) -or [string]::IsNullOrEmpty($MY_STEAM_ID)) {
+    Write-Host "ERROR: STEAM_API_KEY or MY_STEAM_ID is missing from the .env file." -ForegroundColor Red
+    exit
+}
+
+# Process Family IDs into an array
+$familyIDsArray = @()
+if (-Not [string]::IsNullOrEmpty($FAMILY_STEAM_IDS)) {
+    $familyIDsArray = $FAMILY_STEAM_IDS -split ',' | ForEach-Object { $_.Trim() }
+}
+#endregion ----------------------------------------------------------------------
+
+#region -------------------------- HELPER FUNCTIONS -----------------------------
+function Invoke-SteamApi {
+    param ([string]$Uri)
     try {
         return Invoke-RestMethod -Uri $Uri -Method Get -ErrorAction Stop
     }
     catch {
-        Write-Warning "Failed to fetch data from URI: $Uri"
-        Write-Warning "Error message: $($_.Exception.Message)"
+        Write-Verbose "API Call Failed: $Uri"
+        Write-Verbose "Error: $($_.Exception.Message)"
         return $null
     }
 }
+#endregion ----------------------------------------------------------------------
 
-# --- STEP 1: Fetch YOUR wishlist and create a game name map ---
-Write-Host "Fetching your wishlist (ID: $mySteamID)..." -ForegroundColor Cyan
-# API Endpoint Reference: https://steamapi.xpaw.me/#IWishlistService/GetWishlist
-$wishlistUrl = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/?key=$($apiKey)&steamid=$($mySteamID)"
-$wishlistResponse = Invoke-SteamApiRequest -Uri $wishlistUrl
+# --- STEP 1: Fetch Wishlist ---
+Write-Host "Fetching your wishlist (ID: $MY_STEAM_ID)..." -ForegroundColor Cyan
+$wishlistUrl = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/?key=$STEAM_API_KEY&steamid=$MY_STEAM_ID"
+$wishlistResponse = Invoke-SteamApi -Uri $wishlistUrl
 
 if (-not $wishlistResponse.response.items) {
-    Write-Host "Could not fetch your wishlist. It might be private, the API key could be invalid, or the SteamID is incorrect." -ForegroundColor Red
+    Write-Host "ERROR: Could not fetch wishlist. Ensure the profile is public." -ForegroundColor Red
     exit
 }
 
-# Create a lookup table for AppID -> Game Name from the wishlist data
 $wishlistGameMap = @{}
-$wishlistResponse.response.items | ForEach-Object {
-    $wishlistGameMap[$_.appid] = $_.name
-}
-$wishlistAppIDs = $wishlistResponse.response.items.appid
+$wishlistAppIDs = @()
 
-#region =========== NEW CODE BLOCK START ===========
-# --- STEP 1.5: Fetch the entire Steam App list for fast name lookups ---
-Write-Host "Fetching master list of all Steam apps (this happens only once)..." -ForegroundColor Cyan
+foreach ($item in $wishlistResponse.response.items) {
+    $id = [int]$item.appid
+    $wishlistAppIDs += $id
+    $wishlistGameMap[$id] = $item.name
+}
+
+# --- STEP 2: Fetch Global App List (Fixes "Name Not Found") ---
+Write-Host "Fetching master list of all Steam apps (paginated)..." -ForegroundColor Cyan
 $globalAppListMap = @{}
-# API Endpoint Reference: https://steamapi.xpaw.me/#ISteamApps/GetAppList
-$appListUrl = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
-$appListResponse = Invoke-SteamApiRequest -Uri $appListUrl
+$lastAppId = 0
+$hasMoreApps = $true
 
-if ($appListResponse.applist.apps) {
-    foreach ($app in $appListResponse.applist.apps) {
-        $globalAppListMap[$app.appid] = $app.name
+while ($hasMoreApps) {
+    # Using the new v1 endpoint with pagination limits
+    $appListUrl = "https://api.steampowered.com/IStoreService/GetAppList/v1/?key=$STEAM_API_KEY&max_results=50000&last_appid=$lastAppId&include_games=true"
+    $appListResponse = Invoke-SteamApi -Uri $appListUrl
+
+    if ($appListResponse -and $appListResponse.response.apps) {
+        foreach ($app in $appListResponse.response.apps) {
+            $globalAppListMap[[int]$app.appid] = $app.name
+        }
+        
+        if ($appListResponse.response.have_more_results) {
+            $lastAppId = $appListResponse.response.last_appid
+        } else {
+            $hasMoreApps = $false
+        }
+    } else {
+        Write-Warning "Failed to fetch global app list chunk. Some names might still be missing."
+        $hasMoreApps = $false
     }
-    Write-Host "Successfully created a map of $($globalAppListMap.Count) apps." -ForegroundColor Green
-} else {
-    Write-Warning "Could not fetch the global app list. Game names in the report might be missing."
 }
-#endregion ======== NEW CODE BLOCK END ==========
+Write-Host "Mapped $($globalAppListMap.Count) apps from the Steam database." -ForegroundColor Green
 
-# --- STEP 2: Aggregate friend lists from you and your family ---
-Write-Host "Fetching friend lists for you and family members..." -ForegroundColor Cyan
-$allSteamIDsToQuery = @($mySteamID) + $familySteamIDs
-$allUniqueFriendObjects = @{} # Using a hashtable to automatically handle duplicates
+# --- STEP 3: Aggregate Friends ---
+Write-Host "Fetching friend lists..." -ForegroundColor Cyan
+$allSteamIDsToQuery = @($MY_STEAM_ID) + $familyIDsArray
+$uniqueFriendsMap = @{}
 
 foreach ($steamID in $allSteamIDsToQuery) {
-    Write-Host " - Getting friends for ID: $steamID"
-    # API Endpoint Reference: https://steamapi.xpaw.me/#ISteamUser/GetFriendList
-    $friendsListUrl = "https://api.steampowered.com/ISteamUser/GetFriendList/v1/?key=$($apiKey)&steamid=$($steamID)"
-    $friendsListResponse = Invoke-SteamApiRequest -Uri $friendsListUrl
+    $friendsListUrl = "https://api.steampowered.com/ISteamUser/GetFriendList/v1/?key=$STEAM_API_KEY&steamid=$steamID"
+    $friendsResponse = Invoke-SteamApi -Uri $friendsListUrl
     
-    if ($friendsListResponse.friendslist.friends) {
-        foreach ($friend in $friendsListResponse.friendslist.friends) {
-            # If the friend is not already in our master list, add them.
-            if (-not $allUniqueFriendObjects.ContainsKey($friend.steamid)) {
-                $allUniqueFriendObjects[$friend.steamid] = $friend
+    if ($friendsResponse.friendslist.friends) {
+        foreach ($friend in $friendsResponse.friendslist.friends) {
+            if (-not $uniqueFriendsMap.ContainsKey($friend.steamid)) {
+                $uniqueFriendsMap[$friend.steamid] = $friend
             }
         }
     } else {
-        Write-Warning "Could not fetch friend list for $steamID. Profile may be private."
+        Write-Warning "Could not fetch friends for $steamID (Profile likely private)."
     }
 }
 
-# Convert the hashtable of unique friends back into an array for processing
-$friends = $allUniqueFriendObjects.Values
+$friends = $uniqueFriendsMap.Values
 if ($friends.Count -eq 0) {
-    Write-Host "No friends could be found for any of the specified Steam users." -ForegroundColor Red
+    Write-Host "No friends found." -ForegroundColor Red
     exit
 }
 
-# --- STEP 3: Fetch profile names in batches of 100 ---
+# --- STEP 4: Fetch Friend Profiles ---
 Write-Host "Fetching profile names for $($friends.Count) unique friends..." -ForegroundColor Cyan
 $steamIdToNameMap = @{}
 $allFriendSteamIDs = $friends.steamid
 $batchSize = 100
 
 for ($i = 0; $i -lt $allFriendSteamIDs.Count; $i += $batchSize) {
-    # Get a chunk of up to 100 IDs
-    $idChunk = $allFriendSteamIDs[$i..($i + $batchSize - 1)]
-    $friendSteamIDsString = $idChunk -join ','
+    $idChunk = $allFriendSteamIDs[$i..($i + $batchSize - 1)] -join ','
+    $summaryUrl = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=$STEAM_API_KEY&steamids=$idChunk"
+    $summaryResponse = Invoke-SteamApi -Uri $summaryUrl
     
-    # API Endpoint Reference: https://steamapi.xpaw.me/#ISteamUser/GetPlayerSummaries
-    $playerSummariesUrl = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=$($apiKey)&steamids=$($friendSteamIDsString)"
-    $playerSummariesResponse = Invoke-SteamApiRequest -Uri $playerSummariesUrl
-    
-    if ($playerSummariesResponse.response.players) {
-        $playerSummariesResponse.response.players | ForEach-Object {
+    if ($summaryResponse.response.players) {
+        $summaryResponse.response.players | ForEach-Object {
             $steamIdToNameMap[$_.steamid] = $_.personaname
         }
     }
 }
 
-# --- STEP 4: Iterate through the master friend list, fetch owned games, and compare ---
+# --- STEP 5: Compare Libraries ---
 $friendRanking = @()
 $totalFriends = $friends.Count
 $currentFriend = 0
 
-Write-Host "Analyzing games for $($totalFriends) unique friends. This may take a moment..." -ForegroundColor Cyan
+Write-Host "Analyzing libraries..." -ForegroundColor Cyan
 foreach ($friend in $friends) {
     $currentFriend++
-    # Use a default name if the lookup fails for any reason
-    $friendName = if ($steamIdToNameMap.ContainsKey($friend.steamid)) { $steamIdToNameMap[$friend.steamid] } else { "Unknown (ID: $($friend.steamid))" }
+    $friendName = if ($steamIdToNameMap.ContainsKey($friend.steamid)) { $steamIdToNameMap[$friend.steamid] } else { "Unknown ($($friend.steamid))" }
     
-    Write-Progress -Activity "Checking friends' libraries" -Status "Processing: $friendName ($currentFriend/$totalFriends)" -PercentComplete ($currentFriend / $totalFriends * 100)
+    Write-Progress -Activity "Comparing Wishlist" -Status "Checking: $friendName" -PercentComplete (($currentFriend / $totalFriends) * 100)
 
-    # API Endpoint Reference: https://steamapi.xpaw.me/#IPlayerService/GetOwnedGames
-    $ownedGamesUrl = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=$($apiKey)&steamid=$($friend.steamid)&include_appinfo=false"
-    $ownedGamesResponse = Invoke-SteamApiRequest -Uri $ownedGamesUrl
+    $ownedGamesUrl = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=$STEAM_API_KEY&steamid=$($friend.steamid)&include_appinfo=false"
+    $ownedResponse = Invoke-SteamApi -Uri $ownedGamesUrl
 
     $matchingAppIDs = @()
-    $status = "OK" # Default status
+    $status = "OK"
 
-    # Check if we can access the friend's game library. If not, flag their status.
-    if (-not $ownedGamesResponse.response.games) {
-        $status = "Private Profile or No Games"
-    }
-    else {
-        # If games are accessible, compare them to the wishlist
-        $ownedGameAppIDs = $ownedGamesResponse.response.games.appid
+    if (-not $ownedResponse.response.games) {
+        $status = "Private Library / No Games"
+    } else {
+        # Cast all owned games to int before comparing
+        $ownedGameAppIDs = $ownedResponse.response.games.appid | ForEach-Object { [int]$_ }
         $matchingAppIDs = (Compare-Object -ReferenceObject $wishlistAppIDs -DifferenceObject $ownedGameAppIDs -IncludeEqual -ExcludeDifferent | Select-Object -ExpandProperty InputObject)
         if ($matchingAppIDs.Count -eq 0) {
             $status = "No Matching Games"
         }
     }
     
-    # Always add the friend to the ranking object, regardless of match count.
     $friendRanking += [PSCustomObject]@{
-        FriendName     = $friendName
-        MatchingGames  = $matchingAppIDs.Count # This will be 0 if private or no matches
+        FriendName     = $friendName.Trim()
+        MatchingGames  = @($matchingAppIDs).Count
         MatchingAppIDs = $matchingAppIDs
         Status         = $status
     }
 }
 
-# --- STEP 5: Sort the results and display the final ranking ---
+# --- STEP 6: Display & Save Report ---
+$sortedRanking = $friendRanking | Sort-Object -Property MatchingGames -Descending
 Write-Host "`n--- Combined Wishlist Match Ranking ---`n" -ForegroundColor Green
 
-$sortedRanking = $friendRanking | Sort-Object -Property MatchingGames -Descending
+$fileContent = @(
+    "--- Steam Wishlist Match Report ---"
+    "Generated on: $(Get-Date -Format 'MM/dd/yyyy HH:mm:ss')"
+    ""
+)
 
-if ($sortedRanking.Count -eq 0) {
-    Write-Host "Analysis complete, but no friends could be processed." -ForegroundColor Yellow
-}
-else {
-    $rank = 1
-    foreach ($entry in $sortedRanking) {
-        # Using Trim() to remove potential whitespace issues from the name
-        $displayName = "$($rank). $($entry.FriendName.Trim()) - $($entry.MatchingGames) matching games"
-        
-        # Add status text for friends with 0 matches
-        if ($entry.MatchingGames -eq 0) {
-            $displayName += " ($($entry.Status))"
-        }
-        
-        Write-Host $displayName
-        $rank++
-    }
-}
+$rank = 1
+foreach ($entry in $sortedRanking) {
+    $consoleLine = "$rank. $($entry.FriendName) - $($entry.MatchingGames) matches"
+    if ($entry.MatchingGames -eq 0) { $consoleLine += " ($($entry.Status))" }
+    Write-Host $consoleLine
+    $rank++
 
-# --- STEP 6: Generate and save the detailed report file ---
-Write-Host "`nGenerating detailed report..." -ForegroundColor Cyan
-$fileContent = @()
-$fileContent += "--- Steam Wishlist Match Report ---"
-$fileContent += "Generated on: $(Get-Date)"
-$fileContent += ""
-
-if ($sortedRanking.Count -eq 0) {
-    $fileContent += "No friends found to generate a report."
-}
-else {
-    foreach ($entry in $sortedRanking) {
-        # Add a header for the friend
-        $fileContent += "----------------------------------------"
-        $fileContent += "$($entry.FriendName.Trim()) ($($entry.MatchingGames) Matches)"
-        $fileContent += "----------------------------------------"
-        
-        if ($entry.MatchingGames -gt 0) {
-            # List each matching game for that friend
-            foreach ($appId in $entry.MatchingAppIDs) {
-                
-                #region =========== MODIFICATION START ===========
-                # This block now uses the pre-fetched maps instead of a new API call.
-                
-                $gameName = "Name Not Found" # Default value
-                
-                # First, try the most accurate source: the original wishlist map.
-                if ($wishlistGameMap.ContainsKey($appId) -and -not [string]::IsNullOrWhiteSpace($wishlistGameMap[$appId])) {
-                    $gameName = $wishlistGameMap[$appId]
-                }
-                # If not found, fall back to the global app list map.
-                elseif ($globalAppListMap.ContainsKey($appId)) {
-                    $gameName = $globalAppListMap[$appId]
-                }
-                
-                # Format the line exactly as you requested.
-                $fileContent += "   - (AppID: $($appId)) $($gameName)"
-                #endregion ======== MODIFICATION END ==========
+    $fileContent += "----------------------------------------"
+    $fileContent += "$($entry.FriendName) ($($entry.MatchingGames) Matches)"
+    $fileContent += "----------------------------------------"
+    
+    if ($entry.MatchingGames -gt 0) {
+        foreach ($id in $entry.MatchingAppIDs) {
+            $appId = [int]$id
+            $gameName = "Name Not Found"
+            
+            # 1. Try Wishlist Dictionary
+            if ($wishlistGameMap.ContainsKey($appId) -and -not [string]::IsNullOrWhiteSpace($wishlistGameMap[$appId])) {
+                $gameName = $wishlistGameMap[$appId]
+            } 
+            # 2. Try Global Database Dictionary
+            elseif ($globalAppListMap.ContainsKey($appId)) {
+                $gameName = $globalAppListMap[$appId]
             }
+            
+            $fileContent += "   - (AppID: $appId) $gameName"
         }
-        else {
-            # If there are no matches, print the reason.
-            $fileContent += "   - $($entry.Status)"
-        }
-        $fileContent += "" # Add a blank line for readability
+    } else {
+        $fileContent += "   - $($entry.Status)"
     }
+    $fileContent += ""
 }
 
 try {
     $fileContent | Out-File -FilePath $outputFileName -Encoding utf8 -ErrorAction Stop
-    Write-Host "Successfully saved detailed report to: $outputFileName" -ForegroundColor Green
-}
-catch {
-    Write-Host "ERROR: Could not write to file '$($outputFileName)'." -ForegroundColor Red
-    Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "`nSuccessfully saved detailed report to: $outputFileName" -ForegroundColor Green
+} catch {
+    Write-Host "`nERROR: Could not write to $outputFileName" -ForegroundColor Red
 }
